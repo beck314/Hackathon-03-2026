@@ -1,0 +1,109 @@
+import requests
+import os
+import random
+from pydub import AudioSegment
+import pandas as pd
+from tqdm import tqdm
+
+from pydub.utils import which
+print("ffmpeg path:", which("ffmpeg"))
+
+
+KEY = "31ab18c2d5e796a6e3fce82c86151115560ede67"
+BASE_URL = "https://xeno-canto.org/api/3/recordings" 
+QUERY = "sp:fuscus"
+TARGET_FILES = 400
+MAX_DURATION_MS = 30 * 1000  # 30 seconds
+
+DOWNLOAD_DIR = "raw_audio"
+PROCESSED_DIR = "processed_audio"
+
+os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+os.makedirs(PROCESSED_DIR, exist_ok=True)
+
+metadata_rows = []
+saved_count = 0
+page = 1
+
+def download_file(url, path):
+    try:
+        r = requests.get(url, timeout=20)
+        if r.status_code == 200:
+            with open(path, "wb") as f:
+                f.write(r.content)
+            return True
+    except:
+        return False
+    return False
+
+while saved_count < TARGET_FILES:
+    print(f"Fetching page {page}")
+    data = requests.get(BASE_URL, params={"query": QUERY, "page": page, "key":KEY}, timeout=20).json()
+    if "recordings" not in data:
+        print(f"Unexpected response: {data}")
+        break
+    recordings = data["recordings"]
+    '''
+    if not recordings:
+        break
+    '''
+    for r in tqdm(recordings):
+        if saved_count >= TARGET_FILES:
+            break
+
+        rec_id = r["id"]
+        species = f"{r['gen']} {r['sp']}"
+        file_url = "https:" + r["file"]
+
+        raw_path = os.path.join(DOWNLOAD_DIR, f"{rec_id}.mp3")
+        processed_path = os.path.join(PROCESSED_DIR, f"{rec_id}.wav")
+
+        # download if needed
+        if not os.path.exists(raw_path):
+            ok = download_file(file_url, raw_path)
+            if not ok:
+                continue
+
+        try:
+            audio = AudioSegment.from_file(raw_path)
+
+            # skip very short clips (<2s)
+            if len(audio) < 2000:
+                continue
+
+            # clip to max 30s
+            if len(audio) > MAX_DURATION_MS:
+                start = random.randint(0, len(audio) - MAX_DURATION_MS)
+                audio = audio[start:start + MAX_DURATION_MS]
+
+            # standardize
+            audio = audio.set_channels(1).set_frame_rate(32000)
+
+            audio.export(processed_path, format="wav")
+
+            metadata_rows.append({
+                "id": rec_id,
+                "species": species,
+                "file": f"{rec_id}.wav",
+                "duration_sec": len(audio) / 1000,
+                "lat": r.get("lat"),
+                "lng": r.get("lng"),
+                "quality": r.get("q")
+            })
+
+            saved_count += 1
+
+        except Exception as e:
+            print(f"  Failed processing {rec_id}: {e}")
+            continue
+
+    if page >= int(data["numPages"]):
+        break
+
+    page += 1
+
+# save metadata
+df = pd.DataFrame(metadata_rows)
+df.to_csv("uk_birdsong_metadata.csv", index=False)
+
+print(f"\nDone. Saved {saved_count} files.")

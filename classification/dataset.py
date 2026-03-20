@@ -1,156 +1,122 @@
-import os
-import json
 import numpy as np
 import pandas as pd
-import librosa
 from pathlib import Path
-from typing import Optional
 import torch
+import torchaudio
+import torchaudio.transforms as T
 from torch.utils.data import Dataset
-from sklearn.preprocessing import english_cnameEncoder
-import pickle
+from sklearn.preprocessing import LabelEncoder
+import whisper
 
-
-# ── Configuration ─────────────────────────────────────────────────────────────
 
 class Config:
-    # Paths
-    FLAC_DIR      = "archive/songs/songs"          # directory containing .flac files
-    CSV_PATH      = "archive/birdsong_metadata.csv"     # must have columns: file_id, english_cname
-    CACHE_DIR     = "data/cache"          # pre-computed spectrograms saved here
+    FLAC_DIR      = "archive/songs/songs"
+    CSV_PATH      = "archive/birdsong_metadata.csv"
+    CACHE_DIR     = "data/cache"
     MODEL_DIR     = "models"
 
-    # Audio
-    SAMPLE_RATE   = 22050
-    CLIP_DURATION = 5.0                   # seconds — all clips padded/trimmed to this
-    N_FFT         = 2048
-    HOP_LENGTH    = 512
-    N_MELS        = 128                   # mel spectrogram height
-    FMIN          = 500                   # birds rarely sing below 500 Hz
-    FMAX          = 15000                 # upper frequency cutoff
+    # Must match Whisper's expected input
+    SAMPLE_RATE   = 16_000
+    CLIP_DURATION = 5.0
+    N_MELS        = 80
 
-    # Model
-    N_EPOCHS      = 40
+    N_EPOCHS      = 20
     BATCH_SIZE    = 32
     LR            = 3e-4
-    VAL_SPLIT     = 0.15
-    TEST_SPLIT    = 0.15
+    VAL_SPLIT     = 0.1
+    TEST_SPLIT    = 0.35
     SEED          = 42
 
 
-# ── Audio utilities ────────────────────────────────────────────────────────────
+def load_clip(path: str, cfg: Config) -> torch.Tensor:
+    """Load and return a fixed-length mono waveform at 16kHz."""
+    waveform, sr = torchaudio.load(path)
 
-def load_clip(path: str, cfg: Config) -> np.ndarray:
-    """Load, resample, and pad/trim to a fixed-length waveform."""
-    y, _ = librosa.load(path, sr=cfg.SAMPLE_RATE, mono=True,
-                        duration=cfg.CLIP_DURATION)
+    if waveform.shape[0] > 1:
+        waveform = waveform.mean(dim=0, keepdim=True)
+
+    if sr != cfg.SAMPLE_RATE:
+        waveform = T.Resample(sr, cfg.SAMPLE_RATE)(waveform)
+
     target = int(cfg.CLIP_DURATION * cfg.SAMPLE_RATE)
-    if len(y) < target:
-        y = np.pad(y, (0, target - len(y)))
+    if waveform.shape[1] < target:
+        waveform = torch.nn.functional.pad(waveform, (0, target - waveform.shape[1]))
     else:
-        y = y[:target]
-    return y
+        waveform = waveform[:, :target]
+
+    return waveform.squeeze(0)  # (samples,)
 
 
-def augment_waveform(y: np.ndarray, sr: int) -> np.ndarray:
-    """Light data augmentation on the raw waveform."""
-    # Time stretch (±10%)
-    rate = np.random.uniform(0.9, 1.1)
-    y = librosa.effects.time_stretch(y, rate=rate)
+def to_log_mel(waveform: torch.Tensor, cfg: Config) -> torch.Tensor:
+    """
+    Convert waveform → Whisper-compatible log-mel spectrogram (80, T).
+    Uses whisper.log_mel_spectrogram to guarantee encoder compatibility.
+    """
+    # Whisper's function expects exactly 30s of audio at 16kHz
+    chunk = whisper.audio.SAMPLE_RATE * whisper.audio.CHUNK_LENGTH
+    if len(waveform) < chunk:
+        waveform = torch.nn.functional.pad(waveform, (0, chunk - len(waveform)))
+    else:
+        waveform = waveform[:chunk]
 
-    # Pitch shift (±2 semitones)
-    steps = np.random.uniform(-2, 2)
-    y = librosa.effects.pitch_shift(y, sr=sr, n_steps=steps)
+    mel = whisper.log_mel_spectrogram(waveform)  # (80, 3000)
 
-    # Add a little Gaussian noise
-    y = y + np.random.normal(0, 0.005, len(y)).astype(np.float32)
-
-    return y
-
-
-def to_log_mel(y: np.ndarray, cfg: Config) -> np.ndarray:
-    """Convert waveform → log-mel spectrogram, shape (1, N_MELS, T)."""
-    mel = librosa.feature.melspectrogram(
-        y=y, sr=cfg.SAMPLE_RATE,
-        n_fft=cfg.N_FFT, hop_length=cfg.HOP_LENGTH,
-        n_mels=cfg.N_MELS, fmin=cfg.FMIN, fmax=cfg.FMAX,
-    )
-    log_mel = librosa.power_to_db(mel, ref=np.max).astype(np.float32)
-    return log_mel[np.newaxis, ...]          # add channel dim → (1, 128, T)
+    # Slice to our clip duration (3000 frames = 30s, so 5s = 500 frames)
+    t_frames = int(cfg.CLIP_DURATION / whisper.audio.CHUNK_LENGTH * mel.shape[1])
+    return mel[:, :t_frames]  # (80, T)
 
 
-def build_cache(cfg: Config, english_cname_encoder: english_cnameEncoder,
-                df: pd.DataFrame) -> None:
-    """Pre-compute and cache all spectrograms to disk (run once)."""
+def augment(waveform: torch.Tensor, cfg: Config) -> torch.Tensor:
+    """Speed perturb + light noise."""
+    speed    = float(np.random.uniform(0.9, 1.1))
+    waveform = T.Resample(cfg.SAMPLE_RATE, int(cfg.SAMPLE_RATE * speed))(waveform.unsqueeze(0)).squeeze(0)
+
+    target = int(cfg.CLIP_DURATION * cfg.SAMPLE_RATE)
+    if len(waveform) < target:
+        waveform = torch.nn.functional.pad(waveform, (0, target - len(waveform)))
+    else:
+        waveform = waveform[:target]
+
+    return waveform + torch.randn_like(waveform) * 0.005
+
+
+def build_cache(cfg: Config, df: pd.DataFrame) -> None:
     Path(cfg.CACHE_DIR).mkdir(parents=True, exist_ok=True)
     for _, row in df.iterrows():
-        stem = Path(row["file_id"]).stem
+        stem = Path(("xc"+str(row["file_id"]))).stem
         out  = Path(cfg.CACHE_DIR) / f"{stem}.npy"
         if out.exists():
             continue
-        path = str(Path(cfg.FLAC_DIR) / row["file_id"])
         try:
-            y       = load_clip(path, cfg)
-            log_mel = to_log_mel(y, cfg)
-            np.save(out, log_mel)
+            wav = load_clip(str(Path(cfg.FLAC_DIR) / ("xc"+str(row["file_id"]))), cfg)
+            np.save(out, to_log_mel(wav, cfg).numpy())
         except Exception as e:
-            print(f"  ⚠ Skipping {row['file_id']}: {e}")
+            print(f"  ⚠ Skipping {("xc"+str(row['file_id']))}: {e}")
 
-
-# ── PyTorch Dataset ────────────────────────────────────────────────────────────
 
 class BirdsongDataset(Dataset):
-    def __init__(self, df: pd.DataFrame, english_cname_encoder: english_cnameEncoder,
-                 cfg: Config, augment: bool = False):
-        self.df            = df.reset_index(drop=True)
-        self.english_cname_encoder = english_cname_encoder
-        self.cfg           = cfg
-        self.augment       = augment
+    def __init__(self, df: pd.DataFrame, label_encoder: LabelEncoder,
+                 cfg: Config, augment_data: bool = False):
+        self.df           = df.reset_index(drop=True)
+        self.label_encoder = label_encoder
+        self.cfg          = cfg
+        self.augment_data = augment_data
 
     def __len__(self):
         return len(self.df)
 
     def __getitem__(self, idx):
-        row  = self.df.iloc[idx]
-        stem = Path(row["file_id"]).stem
+        row        = self.df.iloc[idx]
+        stem       = Path(("xc"+str(row["file_id"]))).stem
         cache_path = Path(self.cfg.CACHE_DIR) / f"{stem}.npy"
 
-        if cache_path.exists():
-            log_mel = np.load(cache_path)
-            if self.augment:
-                # Re-compute from waveform so augmentation is applied
-                path = str(Path(self.cfg.FLAC_DIR) / row["file_id"])
-                y       = load_clip(path, self.cfg)
-                y       = augment_waveform(y, self.cfg.SAMPLE_RATE)
-                log_mel = to_log_mel(y, self.cfg)
+        if cache_path.exists() and not self.augment_data:
+            mel = torch.tensor(np.load(cache_path))
         else:
-            path    = str(Path(self.cfg.FLAC_DIR) / row["file_id"])
-            y       = load_clip(path, self.cfg)
-            if self.augment:
-                y = augment_waveform(y, self.cfg.SAMPLE_RATE)
-            log_mel = to_log_mel(y, self.cfg)
+            wav = load_clip(str(Path(self.cfg.FLAC_DIR) / ("xc"+str(row["file_id"]))), self.cfg)
+            if self.augment_data:
+                wav = augment(wav, self.cfg)
+            mel = to_log_mel(wav, self.cfg)
 
-        # SpecAugment: randomly mask frequency and time bands
-        if self.augment:
-            log_mel = spec_augment(log_mel)
-
-        english_cname = self.english_cname_encoder.transform([row["english_cname"]])[0]
-        return torch.tensor(log_mel), torch.tensor(english_cname, dtype=torch.long)
-
-
-def spec_augment(spec: np.ndarray,
-                 freq_mask_max: int = 20,
-                 time_mask_max: int = 30,
-                 n_masks: int = 2) -> np.ndarray:
-    """SpecAugment: zero out random frequency and time bands."""
-    spec = spec.copy()
-    _, F, T = spec.shape
-    for _ in range(n_masks):
-        f = np.random.randint(0, freq_mask_max)
-        f0 = np.random.randint(0, max(1, F - f))
-        spec[:, f0:f0 + f, :] = 0
-
-        t = np.random.randint(0, time_mask_max)
-        t0 = np.random.randint(0, max(1, T - t))
-        spec[:, :, t0:t0 + t] = 0
-    return spec
+        label = self.label_encoder.transform([row["english_cname"]])[0]
+        return mel, torch.tensor(label, dtype=torch.long)
